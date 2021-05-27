@@ -1,6 +1,10 @@
 # InjectFix实现原理(三) - 补丁格式
 
-​     
+在本节中，我们主要跟着例子去阅读iFix的源码，看看iFix是如何去生成二进制的补丁文件，其中包括了所有热更新所需的函数及其IL指令。
+
+它的主要原理是用Mono.cecil这个库去反编译出DLL里面的代码（IL指令），然后去找到标记为需要热更新的函数，并将这些函数里面的代码都转成iFix自己实现的虚拟机支持的IL指令，然后将IL指令都保存成二进制的热更新补丁文件。
+
+​            
 
 ## 生成补丁
 
@@ -136,23 +140,23 @@ IFix.exe 这个工具的使用说明为：
 ```bash
 /Applications/Unity/Hub/Editor/2019.4.17f1c1/Unity.app/Contents/Managed/UnityEngine/../../MonoBleedingEdge/bin/mono --debug  --runtime=v4.0.30319 ./IFixToolKit/IFix.exe
 
-# arg[0]: command 
+# arg[0]: command 命令
 -patch   
 
-# arg[1]: core_assmbly_path 
+# arg[1]: core_assmbly_path IFix核心DLL库
 ./Assets/Plugins/IFix.Core.dl
 
-# arg[2]: injected_assmbly_path
+# arg[2]: injected_assmbly_path 被注入的DLL库
 ./Library/ScriptAssemblies/Assembly-CSharp.dll
 null 
 
-# arg[3]: config_path
+# arg[3]: config_path 配置文件（生成的）
 ./process_cfg
 
-# arg[4]: patch_file_output_path
+# arg[4]: patch_file_output_path 补丁的输出路径
 Assembly-CSharp.patch.bytes
 
-# search_path
+# search_path 搜索目录
 /Applications/Unity/Hub/Editor/2019.4.17f1c1/Unity.app/Contents/MonoBleedingEdge/lib/mono/unityjit
 /Applications/Unity/Hub/Editor/2019.4.17f1c1/Unity.app/Contents/Managed/UnityEngine
 /Applications/Unity/Hub/Editor/2019.4.17f1c1/Unity.app/Contents/Managed
@@ -393,6 +397,7 @@ static void Main(string[] args)
                 ilfixAassembly.MainModule.Types.Single(t => t.FullName == "IFix.Core.Utils")
                 .Methods.Single(m => m.Name == "TryAdapterToDelegate"));
 
+        	// 基础类型的IL指令对照表
             ldinds = new Dictionary<TypeReference, OpCode>()
             {
                 {assembly.MainModule.TypeSystem.Boolean, OpCodes.Ldind_U1 },
@@ -448,7 +453,33 @@ static void Main(string[] args)
 }
 ```
 
+​     
 
+emitWrapperManager() 函数生成 WrapperManager类：
+
+```csharp
+class WrapperManagerImpl {
+    
+    private VirtualMachine _virtualMachine;
+    
+    public WrapperManagerImpl(VirtualMachine vm) {
+        super();
+        this._virtualMachine = vm;
+    }
+    
+    public static void GetPatch(int id) {
+        return this.wrapperArray[id];
+    }
+    
+    public static boolean IsPatched(int id) {
+        if (this.wrapperArray.length > 0) {
+            return this.wrapperArray[id] != null;
+        }
+    }
+}
+```
+
+​        
 
 处理需要打补丁的函数：
 
@@ -472,49 +503,141 @@ void processMethod(MethodDefinition method)
 unsafe MethodIdInfo getMethodId(MethodReference callee, MethodDefinition caller, bool isCallvirt,
     bool directCallVirtual = false, InjectType callerInjectType = InjectType.Switch)
 {
-    // 目标方法
-    MethodDefinition method = callee as MethodDefinition;
-    
-    // 如果是dll之外的方法，或者是构造函数，析构函数，作为虚拟机之外（extern）的方法
-    Id = addExternMethod(callee, caller),
-    
-    // 包含不支持指令的方法，作为虚拟机之外（extern）的方法
-}
-
-//原生方法的引用
-int addExternMethod(MethodReference callee, MethodDefinition caller)
-{
-    // ...
-    addExternType(callee.DeclaringType);
-    foreach (var p in callee.Parameters)
-    {
-        addExternType(resolveType);
-    }
-    
-    // ...
-    
-    int methodId = externMethods.Count;
-    externMethodToId[callee] = methodId;
-    externMethods.Add(callee);
-    return methodId;
-}
-
-//再补丁新增一个对原生方法的引用
-int addExternType(TypeReference type, TypeReference contextType = null)
-{
-    // ...
-    externTypes.Add(type);
-    return externTypes.Count - 1;
+	// ...
 }
 ```
 
+`getMethodId` 这个函数很长，逻辑比较复杂，下面我们主要以文字或伪代码的形式来说明它的具体逻辑：
 
+首先我们需要了解到所有的方法分为如下类型:
 
+* Extern, 外部方法（原生方法，如果是dll之外的方法，或者是构造函数，析构函数，作为虚拟机之外（extern）的方法）
+* InteralVirtual, 内部虚方法
+* Internal, 内部方法
+* Invalid, 不支持的方法，例如含泛型方法
 
+​      
+
+然后在处理每一个method的，如果它不是虚函数，或者是外部函数（这里的外部是相对于IFix的虚拟机而已的），则调用 `addExternMethod` 来添加一个原生方法的引用，返回的MethodIdInfo {Type = Extern}
+
+```c#
+int addExternMethod(MethodReference callee, MethodDefinition caller)
+{
+   // 添加方法泛型的Type
+    addExternType(typeArg);
+    
+    // 添加方法返回值的Type
+    addExternType(callee.ReturnType);
+    
+    // 添加方法的类的Type
+    addExternType(callee.DeclaringType)
+    
+    // 添加方法参数的Type
+    addExternType(p.ParameterType);
+    
+    // 最后将其保存起来先
+    externMethodToId[callee] = methodId;
+    externMethods.Add(callee);
+}
+```
+
+并且在依次弄完了各种Type之后，就开始处理method本身，将method转成iFix虚拟机支持的IL指令。
+
+每个method都拥有一系列的Instruction指令集合，一般来说一个method的第一个指令如下：
+
+| Code       | Operand          | Note                                       |
+| ---------- | ---------------- | ------------------------------------------ |
+| StackSpace | local \|maxstack | 该函数的局部变量个数 << 16 \| 最大堆栈大小 |
+
+每个函数第一句都是栈的信息，包括栈上局部变量的个数，栈的大小，这是因为C#虚拟机是基于栈的。
+
+接下面的Instruction指令，就是处理栈上的局部变量的。然后处理函数的异常Exception。
+
+因为这里都是根据Mono.Cecil库解析出来的一个C#函数的所有信息：
+
+```C#
+namespace Mono.Cecil.Cil {
+
+	public sealed class MethodBody {
+        internal int max_stack_size; // 最大栈大小
+		internal int code_size;  // IL指令个数
+		internal bool init_locals; // 局部变量个数
+        
+        internal Collection<Instruction> instructions;  // IL指令
+		internal Collection<ExceptionHandler> exceptions; // 异常
+		internal Collection<VariableDefinition> variables; // 局部变量
+        
+    }
+}
+```
+
+具体可以参考源码：https://github.com/mono/cecil/blob/main/Mono.Cecil.Cil/MethodBody.cs
+
+​         
+
+最后进入正题，就是函数的代码指令集合，`method.Body.Instructions`. 逐条的循环处理每一条IL指令：
+
+处理所有的IL指令的逻辑比较枯燥，大部分情况下都是原样的保存原始的指令，除了几个需要特别处理的IL指令，例如函数调用这种，就需要判断到底是应该跳到哪个函数去执行，因为可能需要调到外部虚拟机的原生代码去执行，又或者需要调到iFix内部的虚拟机的热更新代码。
+
+其实在补丁里面每个函数内的IL指令和正常的一个C#函数的IL指令是差不多的，例如一个C#的函数如下:
+
+```c#
+    public String test(int arg) {
+        A obj;
+    	String a = "hello world";
+        int b = 1;
+        Console.WriteLine(b);
+        obj = new A();
+        Console.WriteLine(obj);
+        return a;
+    }
+```
+
+使用 [Ildasmexe](https://docs.microsoft.com/en-us/dotnet/framework/tools/ildasm-exe-il-disassembler) 工具反编译其IL指令如下：
+
+```
+.method public instance hidebysig cil managed ofname test
+	return: (string)
+	params: (int32 arg)
+{
+	// Code size (0x1C)
+	.locals init ([0] Program/A, [1] string, [2] int32)
+	.maxstack 1
+	IL_0000: ldstr "hello world"
+	IL_0005: stloc.1
+	IL_0006: ldc.i4.1
+	IL_0007: stloc.2
+	IL_0008: ldloc.2
+	IL_0009: call System.Void System.Console::WriteLine(System.Int32)
+	IL_000e: newobj System.Void Program/A::.ctor()
+	IL_0013: stloc.0
+	IL_0014: ldloc.0
+	IL_0015: call System.Void System.Console::WriteLine(System.Object)
+	IL_001a: ldloc.1
+	IL_001b: ret
+}
+```
+
+一个函数的IL指令也是和Mono.Cecil库解析出来的MethodBody是对应的：
+
+* locals 局部变量
+* maxstack 栈大小
+* IL指令
+
+​     
+
+最后处理完所有的函数之后，将所有的函数和指令写入到二进制patch文件中。
 
 
 
 ## 补丁文件格式（二进制）
+
+patch文件的格式如下，大体的结构就是：
+
+* 文件头，魔术等
+* 函数列表
+  * 指令列表
+    * 指令
 
 参考源码：Source\VSProj\Src\Builder\FileVirtualMachineBuilder.cs
 
@@ -525,16 +648,19 @@ int addExternType(TypeReference type, TypeReference contextType = null)
 | externTypeCount         | Int32       |              |
 | methodCount             | Int32       |              |
 
-下面开始遍历method,size为methodCount:
+下面开始是methods集合，遍历method,size为methodCount:
 
 | Name     | Type  | Note |
 | -------- | ----- | ---- |
 | codeSize | Int32 |      |
 
-下面开始遍历code，size为codeSize:
+下面开始是method的Instruction集合，遍历code，size为codeSize:
 
 | Name    | Type  | Note |
 | ------- | ----- | ---- |
 | Code    | Int32 |      |
 | Operand | Int32 |      |
 
+这样就拥有的热更新的二进制补丁文件，接下里只需在动态运行时下发这个二进制补丁文件，加载到iFix的VirtualMachine中，即可实现热更新功能。
+
+在下一节里面，我们将重点研究iFix自己实现的这个VirtualMachine的，来看看这个虚拟机内部是如何去执行这些补丁文件里面的IL指令来实现一个简单的C#虚拟机，这里面重要需要解决的一个疑惑就是：众所周知Mono的C#热更新是很简单的，因为C#本身就很容易通过反射来实现这样的功能，但在il2cpp下的C#热更新就比较复杂了，最常见的问题在il2cpp中的C#是不支持反射接口的，并且每个C#函数在转成CPP的时候都会在其函数名后面增加一串数字，导致每次打包这些函数签名都是变化的，导致很难实现热更新功能，但iFix就能很巧妙的绕开这些限制来实现也支持il2cpp的C#热更新机制。

@@ -1,4 +1,5 @@
-﻿using System.Collections;
+﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using IFix;
@@ -33,8 +34,21 @@ public class NewBehaviourScript : MonoBehaviour
         }
     }
 
+    [Patch]
     public string FuncA()
     {
-        return "Old";
+        return "New";
+    }
+
+    public void callFunc()
+    {
+        string obj = "instance";
+
+        var method = typeof(object).GetMethod("ToString");
+        var ftn = method.MethodHandle.GetFunctionPointer();
+        var func = (Func<string>)Activator.CreateInstance(typeof(Func<string>), obj, ftn);
+
+        var result = func();
+        Debug.Log("result:" + result);
     }
 }
