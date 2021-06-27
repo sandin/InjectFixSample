@@ -51,4 +51,9 @@ public class NewBehaviourScript : MonoBehaviour
         var result = func();
         Debug.Log("result:" + result);
     }
+
+    public void main(string[] args)
+    {
+        Console.WriteLine("Hello World!" + args);
+    }
 }
