@@ -23,6 +23,7 @@ InjectFix是腾讯开源的Unity C#热更新解决方案。
 
 1. [InjectFix实现原理(一) - 如何使用](Docs/1_Introduction.md)
 2. [InjectFix实现原理(二) - 自动插桩](Docs/2_Inject.md)
-3. [InjectFix实现原理(三) - 补丁格式](Docs/3_Fix.md)
+3. [InjectFix实现原理(三) - 生成补丁](Docs/3_Fix.md)
 4. [InjectFix实现原理(四) -IL虚拟机](Docs/4_VirtualMachine.md)
+4. [InjectFix实现原理(五) -加载补丁](Docs/5_LoadPatch.md)
 

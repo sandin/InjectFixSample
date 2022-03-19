@@ -626,7 +626,220 @@ namespace Mono.Cecil.Cil {
 
 ​     
 
+### 序列化补丁到二进制文件
+
 最后处理完所有的函数之后，将所有的函数和指令写入到二进制patch文件中。
+
+#### 序列化外部函数
+
+外部函数在patch二进制文件的结构体如下：
+
+```c#
+    struct IFixExternMethod
+    {
+        bool isGenericInstance;   // MethodReference.IsGenericInstance
+        string declaringType;     // MethodReference.DeclaringType
+        string methodName;        // MethodReference.Name
+        string[] genericArgs;     // GenericInstanceMethod.GenericArguments
+        IFIxParameter[] parameters;
+    }
+
+    struct IFIxParameter
+    {
+        bool isGeneric;
+        string declaringType;
+    }
+```
+
+
+
+这里我们详细的阅读源码看看这些字段具体是存的什么：
+
+首先看函数是不是泛型实例函数 (`isGenericInstance`)，例如泛型函数为：`T Call<T>()` ，那么在真正调用这个函数时，可能引用的函数时该泛型函数的实例：例如 `object Call<object>()` ，其中泛型 `T` 实例为 `object` 类型。
+
+所有函数都会先保存两个字段： 该函数所属的类型 `declaringType`, 该函数的函数名 `methodName`.
+
+如果是泛型函数的实例，主要需要记录的就是泛型的类型列表 `genericArgs`, 保存每一个泛型参数的类型。
+
+然后就是保存函数的参数列表 `parameters`，这里复杂的也是处理泛型，咱们举个例子：
+
+```c#
+class SampleClass<T>
+{
+    void Swap<U>(T t, U u, int i) { }
+}
+```
+
+对于这个函数来说，有3个参数:
+
+* `t`, 类型是泛型 `T`, 这个泛型来自于 `SampleClass`类型( `GenericParameterType.Type`) 。
+* `u`, 类型是泛型 `U`, 这个泛型来自于 `Swap`函数( `GenericParameterType.Method`) 。
+* `i`, 类型是int，它不是一个泛型参数。
+
+
+
+```c#
+    void writeMethod(BinaryWriter writer, MethodReference method)
+    {
+        writer.Write(method.IsGenericInstance);
+        if (method.IsGenericInstance)   // 如果该函数是泛型的实例 （函数本身是不是泛型函数，而不是指参数有没有泛型）
+        {
+            //Console.WriteLine("GenericInstance:" + externMethod);
+            writer.Write(externTypeToId[method.DeclaringType]);  // 函数所在类型
+            writer.Write(method.Name);                           // 函数名
+            // method.IsGenericInstance == true时，MethodReference可向下转型为GenericInstanceMethod泛型实例函数
+            var typeArgs = ((GenericInstanceMethod)method).GenericArguments; // 泛型参数
+            writer.Write(typeArgs.Count);                                    // 泛型参数的个数
+            for (int typeArg = 0;typeArg < typeArgs.Count;typeArg++)
+            {
+                if (isCompilerGenerated(typeArgs[typeArg])) // 如果是编译器生成的类型，则使用bridgeType
+                {
+                    typeArgs[typeArg] = itfBridgeType;
+                }
+                writer.Write(externTypeToId[typeArgs[typeArg]]); // 保存泛型参数的类型
+            }
+            
+            writer.Write(method.Parameters.Count);
+            foreach (var p in method.Parameters)
+            {
+                // 判断一个类型的泛型实参是否有来自函数的泛型实参
+                // 对于ParameterType而言，如果它是GenericParameter子类型，则其Type字段中记录了其泛型是来自于类型还是函数
+                bool paramIsGeneric = p.ParameterType.HasGenericArgumentFromMethod(); 
+                writer.Write(paramIsGeneric);  // 记录该参数为泛型
+                if (paramIsGeneric) // 如果参数的泛型是来自于函数本身
+                {
+                    if (p.ParameterType.IsGenericParameter)
+                    {
+                        writer.Write(p.ParameterType.Name);   // 是泛型，就存泛型参数的名称，它其实是对于类型泛型的引用，即类型泛型列表中的index, 格式为： `!!<index>`，例如: `!!0`, `!!1`, `!!2`, 其中index是method.GetGenericArguments()列表中的index
+                    }
+                    else
+                    {
+                        writer.Write(p.ParameterType.GetAssemblyQualifiedName(method.DeclaringType, true)); // 不是泛型，就存正常的类型，例如 `System.object`
+                    }
+                }
+                else    // 如果参数的泛型来自于外层的类型
+                {
+                    if (p.ParameterType.IsGenericParameter)
+                    {
+                        writer.Write(externTypeToId[(p.ParameterType as GenericParameter)
+                            .ResolveGenericArgument(method.DeclaringType)]);  // 在方法定义的类型中查找泛型参数对应的的实参
+                    }
+                    else
+                    {
+                        writer.Write(externTypeToId[p.ParameterType]);   // 直接用参数的类型即可
+                    }
+                }
+            }
+        }
+        else // 不是泛型函数
+        {
+            //Console.WriteLine("not GenericInstance:" + externMethod);
+            if (!externTypeToId.ContainsKey(method.DeclaringType))
+            {
+                throw new Exception("externTypeToId do not exist key: " + method.DeclaringType
+                    + ", while process method: " + method);
+            }
+            writer.Write(externTypeToId[method.DeclaringType]);
+            writer.Write(method.Name);
+            writer.Write(method.Parameters.Count);
+            foreach (var p in method.Parameters)
+            {
+                var paramType = p.ParameterType;
+                if (paramType.IsGenericParameter) // 是泛型参数
+                {
+                    paramType = (paramType as GenericParameter).ResolveGenericArgument(method.DeclaringType); // 查找泛型实参
+                }
+                if (paramType.IsRequiredModifier)
+                {
+                    paramType = (paramType as RequiredModifierType).ElementType;
+                }
+                if (!externTypeToId.ContainsKey(paramType))
+                {
+                    throw new Exception("externTypeToId do not exist key: " + paramType
+                        + ", while process parameter of method: " + method);
+                }
+                writer.Write(externTypeToId[paramType]);
+            }
+        }
+    }
+
+```
+
+查找泛型参数的实参:
+
+因为这里外层函数是泛型函数的引用，它是明确类型的，例如调用一个泛型函数，调用的时候所有的泛型都有明确的类型，而查找的就是这个明确的类型，例如： 
+
+```c#
+class SampleClass<T>         // 在定义的时候 T 是泛型
+{
+    void Swap(T t1, T t2) { }   // 函数的参数是泛型T，该泛型来自于所属的类型
+}
+
+SampleClass<string> a;         // 在初始化类型的时候，是要求明确泛型的类型的
+a.Swap("string1", "string2");  // 因此在调用泛型函数的时候，参数中的参数如果是来自于类型，那么就可以反查找到该泛型的类型
+```
+
+
+
+具体逻辑如下：
+
+```c#
+        /// <summary>
+        /// 以contextType为上下文，查找泛型参数对应的实参
+        /// </summary>
+        /// <param name="gp">泛型参数</param>
+        /// <param name="contextType">上下文类型</param>
+        /// <returns></returns>
+        public static TypeReference ResolveGenericArgument(this GenericParameter gp, TypeReference contextType)
+        {
+            if (contextType.IsGenericInstance)  // 是泛型实例，GenericInstanceType
+            {
+                var genericIns = ((GenericInstanceType)contextType);
+                var genericTypeRef = genericIns.ElementType;  // 泛型类型的引用
+                var genericTypeDef = genericTypeRef.Resolve(); // 泛型类型的定义
+                for (int i = 0; i < genericTypeRef.GenericParameters.Count; i++) // 类型的泛型列表
+                {
+                    if (genericTypeRef.GenericParameters[i] == gp) // 如果参数的泛型类型 == 类型的泛型类型
+                    {
+                        return genericIns.GenericArguments[i];   // 返回类型的泛型实参
+                    }
+                    if (genericTypeDef != null && genericTypeDef.GenericParameters[i] == gp)
+                    {
+                        return genericIns.GenericArguments[i];
+                    }
+                }
+            }
+
+            if (contextType.IsNested) // 嵌套类
+            {
+                return gp.ResolveGenericArgument(contextType.DeclaringType);
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 以contextMethod为上下文，查找泛型参数对应的实参
+        /// </summary>
+        /// <param name="gp">泛型参数</param>
+        /// <param name="contextMethod">上下文函数</param>
+        /// <returns></returns>
+        public static TypeReference ResolveGenericArgument(this GenericParameter gp, MethodReference contextMethod)
+        {
+            if (contextMethod.IsGenericInstance)
+            {
+                var genericIns = contextMethod as GenericInstanceMethod;
+                return genericIns.GenericArguments[gp.Position];
+            }
+            return null;
+        }
+```
+
+
+
+
 
 
 
